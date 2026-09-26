@@ -9,6 +9,7 @@ import {
   App,
   Button,
   Card,
+  Checkbox,
   Col,
   Empty,
   Form,
@@ -63,9 +64,12 @@ import {
   ROW_REVISION,
   getScene,
   listCuesByScene,
+  listRolesByScene,
   putCue,
+  putRole,
   removeCue,
   type CueRow,
+  type RoleRow,
   type SceneRow,
 } from '../utils/db';
 import { buildRulerTicks, secondsToPercent, secondsToTimecode, timecodeToSeconds } from '../utils/timecode';
@@ -79,6 +83,7 @@ export default function CueTimeline() {
 
   const [scene, setScene] = useState<SceneRow | null>(null);
   const [cues, setCues] = useState<CueRow[]>([]);
+  const [roles, setRoles] = useState<RoleRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [cursorSecond, setCursorSecond] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -94,9 +99,14 @@ export default function CueTimeline() {
 
   const reload = useCallback(async () => {
     setLoading(true);
-    const [sceneRow, cueRows] = await Promise.all([getScene(sceneId), listCuesByScene(sceneId)]);
+    const [sceneRow, cueRows, roleRows] = await Promise.all([
+      getScene(sceneId),
+      listCuesByScene(sceneId),
+      listRolesByScene(sceneId),
+    ]);
     setScene(sceneRow ?? null);
     setCues(cueRows);
+    setRoles(roleRows);
     setLoading(false);
     if (sceneRow) {
       await Promise.all([loadScenes(sceneRow.playId), loadOperators()]);
@@ -118,6 +128,45 @@ export default function CueTimeline() {
   const durationSecond = scene ? Math.max(1, scene.durationMin) * 60 : 60;
   const ticks = useMemo(() => buildRulerTicks(durationSecond), [durationSecond]);
   const sortedCues = useMemo(() => [...cues].sort((a, b) => a.atSecond - b.atSecond), [cues]);
+
+  /** 每处鼓点上挂着的角色（出场时刻随鼓点秒点走；一处鼓点可挂多个角色） */
+  const rolesByCue = useMemo(() => {
+    const cueIds = new Set(cues.map((cue) => cue.id));
+    const map = new Map<string, RoleRow[]>();
+    roles.forEach((role) => {
+      // 挂钩鼓点已不存在的孤儿角色不按已挂钩展示
+      if (role.entranceCueId && !role.entrancePending && cueIds.has(role.entranceCueId)) {
+        const list = map.get(role.entranceCueId) ?? [];
+        list.push(role);
+        map.set(role.entranceCueId, list);
+      }
+    });
+    return map;
+  }, [roles, cues]);
+
+  /** 原挂钩鼓点已撤（含旧档孤儿引用）、出场待重排的角色 */
+  const pendingRoles = useMemo(() => {
+    const cueIds = new Set(cues.map((cue) => cue.id));
+    return roles.filter(
+      (role) => role.entrancePending || (!!role.entranceCueId && !cueIds.has(role.entranceCueId)),
+    );
+  }, [roles, cues]);
+
+  /** 在鼓点侧勾选角色一起亮相：挂到该点上，重新挑点即覆盖原挂钩 */
+  const toggleRoleOnCue = async (cue: CueRow, roleId: string, checked: boolean) => {
+    const target = roles.find((role) => role.id === roleId);
+    if (!target) return;
+    const stamp = nowIso();
+    const next: RoleRow = {
+      ...target,
+      entranceCueId: checked ? cue.id : null,
+      entrancePending: false,
+      updatedAt: stamp,
+      revision: ROW_REVISION,
+    };
+    await putRole(next);
+    setRoles((prev) => prev.map((role) => (role.id === roleId ? next : role)));
+  };
 
   /** 试排播放：按秒推进游标，到时辰停止 */
   const lastFrameRef = useRef<number>(0);
@@ -240,15 +289,32 @@ export default function CueTimeline() {
   };
 
   const handleDelete = (cue: CueRow) => {
+    const linked = roles.filter((role) => role.entranceCueId === cue.id && !role.entrancePending);
     modal.confirm({
       title: `删除 ${secondsToTimecode(cue.atSecond)} 的「${BEAT_NAME_LABEL[cue.beatName]}」？`,
+      content:
+        linked.length > 0
+          ? `鼓点照常删除，但挂在这处上的 ${linked
+              .map((role) => `「${role.name}」`)
+              .join('、')} 将标成「出场待重排」，需重新挑一处挂回。`
+          : '删除后不可恢复。',
       okText: '删除',
       okButtonProps: { danger: true },
       cancelText: '取消',
       onOk: async () => {
-        await removeCue(cue.id);
+        const marked = await removeCue(cue.id);
         setCues((prev) => prev.filter((item) => item.id !== cue.id));
-        message.success('鼓点已删除');
+        setRoles((prev) =>
+          prev.map((role) => {
+            const changed = marked.find((item) => item.id === role.id);
+            return changed ? { ...changed } : role;
+          }),
+        );
+        if (marked.length > 0) {
+          message.warning(`鼓点已撤，${marked.length} 个角色标成「出场待重排」`);
+        } else {
+          message.success('鼓点已删除');
+        }
       },
     });
   };
@@ -298,6 +364,45 @@ export default function CueTimeline() {
           {INSTRUMENT_LABEL[value]}
         </Tag>
       ),
+    },
+    {
+      title: '亮相角色',
+      key: 'linkedRoles',
+      width: 230,
+      render: (_value, record) => {
+        const linked = rolesByCue.get(record.id) ?? [];
+        return (
+          <Space direction="vertical" size={2} style={{ width: '100%' }}>
+            {roles.length === 0 ? (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                本场还没有角色
+              </Typography.Text>
+            ) : (
+              <Checkbox.Group
+                value={linked.map((role) => role.id)}
+                style={{ flexWrap: 'wrap', columnGap: 10 }}
+                options={roles.map((role) => ({ value: role.id, label: role.name }))}
+                onChange={(checked) => {
+                  const nextIds = checked as string[];
+                  // 找出本次勾选 / 取消的那个角色（同组其它角色保持原样）
+                  const added = nextIds.find((id) => !linked.some((role) => role.id === id));
+                  if (added) {
+                    void toggleRoleOnCue(record, added, true);
+                  } else {
+                    const removed = linked.find((role) => !nextIds.includes(role.id));
+                    if (removed) void toggleRoleOnCue(record, removed.id, false);
+                  }
+                }}
+              />
+            )}
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              {linked.length > 0
+                ? `${linked.length} 个角色在此亮相，出场时刻随 ${secondsToTimecode(record.atSecond)} 走`
+                : '未挂角色'}
+            </Typography.Text>
+          </Space>
+        );
+      },
     },
     {
       title: '领奏操耍人',
@@ -513,32 +618,40 @@ export default function CueTimeline() {
                     <span className="gb-mono">{secondsToTimecode(tick)}</span>
                   </div>
                 ))}
-                {sortedCues.map((cue) => (
-                  <div
-                    key={cue.id}
-                    className="gb-cue-dot"
-                    style={{ left: `${secondsToPercent(cue.atSecond, durationSecond)}%` }}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      openEdit(cue);
-                    }}
-                    title={`${secondsToTimecode(cue.atSecond)} ${BEAT_NAME_LABEL[cue.beatName]}（${
-                      INSTRUMENT_LABEL[cue.instrument]
-                    }）点击编辑`}
-                  >
-                    <b className="gb-mono">{secondsToTimecode(cue.atSecond)}</b>
-                    <i
-                      style={{
-                        background: INSTRUMENT_COLOR[cue.instrument],
-                        transform: activeCueId === cue.id ? 'scale(1.6)' : 'scale(1)',
-                        transition: 'transform 0.18s ease',
+                {sortedCues.map((cue) => {
+                  const linked = rolesByCue.get(cue.id) ?? [];
+                  return (
+                    <div
+                      key={cue.id}
+                      className="gb-cue-dot"
+                      style={{ left: `${secondsToPercent(cue.atSecond, durationSecond)}%` }}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        openEdit(cue);
                       }}
-                    />
-                    <span style={{ color: 'rgba(43,26,18,0.7)' }}>
-                      {BEAT_NAME_LABEL[cue.beatName]}·{INSTRUMENT_LABEL[cue.instrument]}
-                    </span>
-                  </div>
-                ))}
+                      title={`${secondsToTimecode(cue.atSecond)} ${BEAT_NAME_LABEL[cue.beatName]}（${
+                        INSTRUMENT_LABEL[cue.instrument]
+                      }）${linked.length > 0 ? ` 亮相：${linked.map((role) => role.name).join('、')}` : ''} 点击编辑`}
+                    >
+                      <b className="gb-mono">{secondsToTimecode(cue.atSecond)}</b>
+                      <i
+                        style={{
+                          background: INSTRUMENT_COLOR[cue.instrument],
+                          transform: activeCueId === cue.id ? 'scale(1.6)' : 'scale(1)',
+                          transition: 'transform 0.18s ease',
+                        }}
+                      />
+                      <span style={{ color: 'rgba(43,26,18,0.7)' }}>
+                        {BEAT_NAME_LABEL[cue.beatName]}·{INSTRUMENT_LABEL[cue.instrument]}
+                      </span>
+                      {linked.length > 0 ? (
+                        <span className="gb-cue-roles gb-mono">
+                          {linked.map((role) => role.name).join('·')}
+                        </span>
+                      ) : null}
+                    </div>
+                  );
+                })}
                 <div className="gb-playhead" style={{ left: `${secondsToPercent(cursorSecond, durationSecond)}%` }} />
               </div>
             </div>
@@ -622,6 +735,26 @@ export default function CueTimeline() {
                 ) : null}
               </Space>
             </div>
+
+            {pendingRoles.length > 0 ? (
+              <Alert
+                style={{ marginBottom: 12 }}
+                type="warning"
+                showIcon
+                message={`${pendingRoles.length} 个角色出场待重排`}
+                description={
+                  <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                    <Typography.Text style={{ fontSize: 12 }}>
+                      原鼓点已撤的角色：{pendingRoles.map((role) => `「${role.name}」`).join('、')}。
+                      在下方鼓点勾选角色，或到角色页重新挑一处挂回。
+                    </Typography.Text>
+                    <Button size="small" icon={<TeamOutlined />} onClick={() => navigate(ROUTES.roles(sceneId))}>
+                      去角色页重排出场
+                    </Button>
+                  </Space>
+                }
+              />
+            ) : null}
 
             {cues.length === 0 ? (
               <EmptyState

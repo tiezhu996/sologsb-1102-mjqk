@@ -14,7 +14,7 @@ import { nowIso } from './uuid';
 import { seedDatabase } from './seed';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** 数据库名 */
 export const DB_NAME = 'gbshadowplay';
@@ -31,7 +31,7 @@ export type RoleRow = ShadowRole & Revisioned;
 export type OperatorRow = Operator & Revisioned;
 export type CueRow = PercussionCue & Revisioned;
 
-export const ROW_REVISION = 2;
+export const ROW_REVISION = 3;
 
 class ShadowPlayDatabase extends Dexie {
   plays!: Table<PlayRow, string>;
@@ -77,6 +77,27 @@ class ShadowPlayDatabase extends Dexie {
             if (typeof row.createdAt !== 'string') row.createdAt = row.updatedAt;
           });
         }
+      });
+
+    // v3：角色出场挂钩到本场锣鼓点（entranceCueId）；挂钩鼓点撤掉后角色转为出场待重排（entrancePending）
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        plays: 'id, title, genre, status, createdAt, updatedAt',
+        scenes: 'id, playId, seq, progress, needsShadowScreen',
+        roles: 'id, sceneId, operatorId, roleType, name, entranceCueId, entrancePending',
+        operators: 'id, name, rehearsalHours',
+        cues: 'id, sceneId, atSecond, instrument, beatName',
+      })
+      .upgrade(async (tx) => {
+        // 迁移：历史角色都还没有挂钩，只保留手写提示，按未挂钩处理
+        await tx
+          .table<Record<string, unknown>, string>('roles')
+          .toCollection()
+          .modify((row) => {
+            if (typeof row.entranceCueId !== 'string') row.entranceCueId = null;
+            if (typeof row.entrancePending !== 'boolean') row.entrancePending = false;
+            row.revision = ROW_REVISION;
+          });
       });
   }
 }
@@ -210,8 +231,30 @@ export async function putCue(row: CueRow): Promise<void> {
   await db.cues.put(row);
 }
 
-export async function removeCue(id: string): Promise<void> {
-  await db.cues.delete(id);
+/** 挂在某一处鼓点上的角色（一处鼓点可挂多个角色一起亮相） */
+export async function listRolesByCue(cueId: string): Promise<RoleRow[]> {
+  return db.roles.where('entranceCueId').equals(cueId).toArray();
+}
+
+/**
+ * 撤掉一处鼓点。
+ * 鼓点照常删除，但挂过它的角色不删，只标成「出场待重排」，
+ * 等重新挑一处鼓点挂上才补齐；手写出场提示原样保留。
+ */
+export async function removeCue(id: string): Promise<RoleRow[]> {
+  return db.transaction('rw', db.cues, db.roles, async () => {
+    const linked = await db.roles.where('entranceCueId').equals(id).toArray();
+    const stamp = nowIso();
+    const marked = linked.map((role) => ({
+      ...role,
+      entrancePending: true,
+      updatedAt: stamp,
+      revision: ROW_REVISION,
+    }));
+    if (marked.length > 0) await db.roles.bulkPut(marked);
+    await db.cues.delete(id);
+    return marked;
+  });
 }
 
 /* --------------------------- 整库导入导出 --------------------------- */
@@ -266,7 +309,16 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION });
     await db.plays.bulkPut(snapshot.plays.map(rev));
     await db.scenes.bulkPut(snapshot.scenes.map(rev));
-    await db.roles.bulkPut(snapshot.roles.map(rev));
+    await db.roles.bulkPut(
+      // 旧版存档没有出场挂钩字段：导入后按未挂钩处理，手写提示保留
+      snapshot.roles.map((role) =>
+        rev({
+          ...role,
+          entranceCueId: typeof role.entranceCueId === 'string' ? role.entranceCueId : null,
+          entrancePending: role.entrancePending === true,
+        }),
+      ),
+    );
     await db.operators.bulkPut(snapshot.operators.map(rev));
     await db.cues.bulkPut(snapshot.cues.map(rev));
   });

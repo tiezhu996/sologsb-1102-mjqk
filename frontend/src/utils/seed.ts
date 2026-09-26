@@ -16,6 +16,8 @@ interface SeedSceneSpec {
     roleType: RoleRow['roleType'];
     propParts: RoleRow['propParts'];
     entranceCue: string;
+    /** 出场挂钩：同场 cues 数组的下标；null 表示只留手写提示（未挂钩） */
+    entranceCueIndex: number | null;
     lineNote: string;
     operatorIndex: number | null;
   }>;
@@ -91,6 +93,7 @@ const PLAYS: SeedPlaySpec[] = [
             roleType: 'dan',
             propParts: ['toucha', 'shenduan'],
             entranceCue: '四击头落定后自影窗右侧起伞',
+            entranceCueIndex: 0,
             lineNote: '「十年修得同船渡」一句拖腔走满八拍',
             operatorIndex: 0,
           },
@@ -99,6 +102,7 @@ const PLAYS: SeedPlaySpec[] = [
             roleType: 'sheng',
             propParts: ['toucha', 'shenduan'],
             entranceCue: '小锣三击后自左侧上场',
+            entranceCueIndex: null,
             lineNote: '念白需压住锣鼓点，末字落在板上',
             operatorIndex: 3,
           },
@@ -120,6 +124,7 @@ const PLAYS: SeedPlaySpec[] = [
             roleType: 'dan',
             propParts: ['toucha', 'shenduan'],
             entranceCue: '喜乐起后自中门上场',
+            entranceCueIndex: null,
             lineNote: '唱段第二句转慢板，注意换气',
             operatorIndex: 0,
           },
@@ -128,6 +133,7 @@ const PLAYS: SeedPlaySpec[] = [
             roleType: 'dan',
             propParts: ['toucha', 'shenduan', 'bingqi'],
             entranceCue: '大锣一击亮剑花',
+            entranceCueIndex: 1,
             lineNote: '剑花与铙钹同起同落',
             operatorIndex: 1,
           },
@@ -136,6 +142,7 @@ const PLAYS: SeedPlaySpec[] = [
             roleType: 'jing',
             propParts: ['toucha', 'shenduan'],
             entranceCue: '闷帘念白后上场',
+            entranceCueIndex: 0,
             lineNote: '念白多用丹田音，压过小锣',
             operatorIndex: 2,
           },
@@ -157,6 +164,7 @@ const PLAYS: SeedPlaySpec[] = [
             roleType: 'dan',
             propParts: ['toucha', 'shenduan', 'bingqi'],
             entranceCue: '水声起后踏浪上场',
+            entranceCueIndex: 0,
             lineNote: '高腔需与铙钹对咬，不可拖',
             operatorIndex: 1,
           },
@@ -165,6 +173,7 @@ const PLAYS: SeedPlaySpec[] = [
             roleType: 'shenguai',
             propParts: ['toucha', 'shenduan'],
             entranceCue: '急急风起连绵入场',
+            entranceCueIndex: 1,
             lineNote: '群场走位对齐鼓点，不开口',
             operatorIndex: 2,
           },
@@ -173,6 +182,7 @@ const PLAYS: SeedPlaySpec[] = [
             roleType: 'sheng',
             propParts: ['toucha', 'shenduan'],
             entranceCue: '小锣一击后跌步上场',
+            entranceCueIndex: 0,
             lineNote: '跌步含三次呼吸，落在板上',
             operatorIndex: 3,
           },
@@ -205,6 +215,7 @@ const PLAYS: SeedPlaySpec[] = [
             roleType: 'chou',
             propParts: ['toucha', 'shenduan'],
             entranceCue: '板鼓独奏中自影窗左侧入',
+            entranceCueIndex: 0,
             lineNote: '念白带乡音，尾音落小锣',
             operatorIndex: 3,
           },
@@ -223,6 +234,7 @@ const PLAYS: SeedPlaySpec[] = [
             roleType: 'sheng',
             propParts: ['toucha', 'shenduan', 'bingqi'],
             entranceCue: '急急风起，快步上场',
+            entranceCueIndex: null,
             lineNote: '唱段节奏偏快，需咬清字头',
             operatorIndex: null,
           },
@@ -250,6 +262,7 @@ const PLAYS: SeedPlaySpec[] = [
             roleType: 'chou',
             propParts: ['toucha', 'shenduan', 'bingqi'],
             entranceCue: '四击头后翻身上场',
+            entranceCueIndex: 0,
             lineNote: '念白快而脆，末字落在板上',
             operatorIndex: 1,
           },
@@ -258,6 +271,7 @@ const PLAYS: SeedPlaySpec[] = [
             roleType: 'dan',
             propParts: ['toucha', 'shenduan', 'bingqi'],
             entranceCue: '大锣一击亮扇',
+            entranceCueIndex: 0,
             lineNote: '与悟空对咬鼓点，不可抢板',
             operatorIndex: 2,
           },
@@ -319,28 +333,10 @@ export async function seedDatabase(): Promise<void> {
         revision: ROW_REVISION,
       });
 
-      sceneSpec.roles.forEach((roleSpec) => {
-        const operator = roleSpec.operatorIndex === null ? null : operatorRows[roleSpec.operatorIndex];
-        const roleId = uuid();
-        roleRows.push({
-          id: roleId,
-          sceneId,
-          name: roleSpec.name,
-          roleType: roleSpec.roleType,
-          propParts: [...roleSpec.propParts],
-          entranceCue: roleSpec.entranceCue,
-          lineNote: roleSpec.lineNote,
-          operatorId: operator ? operator.id : null,
-          createdAt: stamp,
-          updatedAt: stamp,
-          revision: ROW_REVISION,
-        });
-        if (operator) operator.assignedRoleIds.push(roleId);
-      });
-
-      sceneSpec.cues.forEach((cueSpec) => {
+      // 先建鼓点，角色出场才能挂到鼓点 id 上（一处鼓点可挂多个角色）
+      const sceneCueRows: CueRow[] = sceneSpec.cues.map((cueSpec) => {
         const lead = cueSpec.leadOperatorIndex === null ? null : operatorRows[cueSpec.leadOperatorIndex];
-        cueRows.push({
+        return {
           id: uuid(),
           sceneId,
           beatName: cueSpec.beatName,
@@ -351,7 +347,30 @@ export async function seedDatabase(): Promise<void> {
           createdAt: stamp,
           updatedAt: stamp,
           revision: ROW_REVISION,
+        };
+      });
+      cueRows.push(...sceneCueRows);
+
+      sceneSpec.roles.forEach((roleSpec) => {
+        const operator = roleSpec.operatorIndex === null ? null : operatorRows[roleSpec.operatorIndex];
+        const linkedCue = roleSpec.entranceCueIndex === null ? null : sceneCueRows[roleSpec.entranceCueIndex] ?? null;
+        const roleId = uuid();
+        roleRows.push({
+          id: roleId,
+          sceneId,
+          name: roleSpec.name,
+          roleType: roleSpec.roleType,
+          propParts: [...roleSpec.propParts],
+          entranceCue: roleSpec.entranceCue,
+          entranceCueId: linkedCue ? linkedCue.id : null,
+          entrancePending: false,
+          lineNote: roleSpec.lineNote,
+          operatorId: operator ? operator.id : null,
+          createdAt: stamp,
+          updatedAt: stamp,
+          revision: ROW_REVISION,
         });
+        if (operator) operator.assignedRoleIds.push(roleId);
       });
     });
   });

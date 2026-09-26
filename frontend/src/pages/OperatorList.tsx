@@ -55,7 +55,7 @@ import {
   type SkillTag,
   type Weekday,
 } from '../types/operator';
-import { PROP_PART_LABEL, ROLE_TYPE_COLOR, ROLE_TYPE_LABEL } from '../types/role';
+import { PROP_PART_LABEL, ROLE_TYPE_COLOR, ROLE_TYPE_LABEL, entranceLinkState } from '../types/role';
 import { ROW_REVISION, listAllRoles, putOperator, type OperatorRow, type RoleRow } from '../utils/db';
 import { exportOperatorCsvFile } from '../utils/export';
 import { nowIso } from '../utils/uuid';
@@ -279,7 +279,17 @@ export default function OperatorList() {
       render: (value: RoleRow['propParts']) =>
         value.length > 0 ? value.map((part) => PROP_PART_LABEL[part]).join('／') : '无需拆件',
     },
-    { title: '出场提示', dataIndex: 'entranceCue', ellipsis: true },
+    {
+      title: '出场提示',
+      dataIndex: 'entranceCue',
+      ellipsis: true,
+      render: (value: string, record: RoleRow) => (
+        <Space size={4}>
+          {entranceLinkState(record) === 'pending' ? <Tag color="error">出场待重排</Tag> : null}
+          <span>{value || '—'}</span>
+        </Space>
+      ),
+    },
     {
       title: '操作',
       key: 'action',

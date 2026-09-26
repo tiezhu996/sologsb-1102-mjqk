@@ -29,6 +29,7 @@ import {
   ArrowLeftOutlined,
   ArrowRightOutlined,
   DeleteOutlined,
+  LinkOutlined,
   PlusOutlined,
   ReloadOutlined,
   SaveOutlined,
@@ -49,20 +50,25 @@ import {
   ROLE_TYPE_LABEL,
   ROLE_TYPE_OPTIONS,
   createEmptyRoleDraft,
+  entranceLinkState,
   type PropPart,
   type RoleDraft,
   type RoleType,
 } from '../types/role';
 import { SHADOW_SCREEN_LABEL } from '../types/scene';
+import { BEAT_NAME_LABEL } from '../types/cue';
 import {
   ROW_REVISION,
   getScene,
+  listCuesByScene,
   listRolesByScene,
   putRole,
   removeRole,
+  type CueRow,
   type RoleRow,
   type SceneRow,
 } from '../utils/db';
+import { secondsToTimecode } from '../utils/timecode';
 import { nowIso, uuid } from '../utils/uuid';
 
 export default function RoleAssign() {
@@ -73,6 +79,7 @@ export default function RoleAssign() {
 
   const [scene, setScene] = useState<SceneRow | null>(null);
   const [roles, setRoles] = useState<RoleRow[]>([]);
+  const [cues, setCues] = useState<CueRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [modalOpen, setModalOpen] = useState(false);
 
@@ -87,12 +94,14 @@ export default function RoleAssign() {
 
   const reload = useCallback(async () => {
     setLoading(true);
-    const [sceneRow, roleRows] = await Promise.all([
+    const [sceneRow, roleRows, cueRows] = await Promise.all([
       getScene(sceneId),
       listRolesByScene(sceneId),
+      listCuesByScene(sceneId),
     ]);
     setScene(sceneRow ?? null);
     setRoles(roleRows);
+    setCues(cueRows);
     setLoading(false);
     if (sceneRow) {
       await Promise.all([loadScenes(sceneRow.playId), loadOperators()]);
@@ -111,6 +120,43 @@ export default function RoleAssign() {
 
   const assignedCount = roles.filter((role) => role.operatorId !== null).length;
   const propPartTotal = roles.reduce((acc, role) => acc + role.propParts.length, 0);
+
+  /** 本场鼓点按 id 索引，角色出场时刻直接取鼓点秒点，鼓点调了不用手工抄 */
+  const cueById = useMemo(() => new Map(cues.map((cue) => [cue.id, cue])), [cues]);
+
+  /** 出场是否待重排：标记位为真，或挂钩鼓点已不存在（孤儿引用，多来自旧档导入） */
+  const isEntrancePending = useCallback(
+    (role: RoleRow): boolean =>
+      entranceLinkState(role) === 'pending' ||
+      (!!role.entranceCueId && !cueById.has(role.entranceCueId)),
+    [cueById],
+  );
+
+  const pendingEntranceCount = roles.filter((role) => isEntrancePending(role)).length;
+
+  /** 一处鼓点上挂着的角色，用于下拉里提示「同点亮相」 */
+  const roleNamesByCue = useMemo(() => {
+    const map = new Map<string, string[]>();
+    roles.forEach((role) => {
+      if (role.entranceCueId && !isEntrancePending(role)) {
+        const list = map.get(role.entranceCueId) ?? [];
+        list.push(role.name);
+        map.set(role.entranceCueId, list);
+      }
+    });
+    return map;
+  }, [roles, isEntrancePending]);
+
+  /** 把角色出场挂到本场某一处鼓点上；重新挑一处即补齐「待重排」 */
+  const handleLinkCue = async (roleId: string, cueId: string | null) => {
+    await patchRole(roleId, { entranceCueId: cueId, entrancePending: false });
+    if (cueId) {
+      const cue = cueById.get(cueId);
+      message.success(cue ? `出场已挂到 ${secondsToTimecode(cue.atSecond)}「${BEAT_NAME_LABEL[cue.beatName]}」` : '出场已挂钩鼓点');
+    } else {
+      message.success('已取下挂钩，保留手写提示（未挂钩）');
+    }
+  };
 
   /** 每个角色的候选操耍人（含冲突评估），供 <AssigneePicker> 使用 */
   const optionsFor = useCallback(
@@ -140,6 +186,8 @@ export default function RoleAssign() {
       roleType: values.roleType,
       propParts: [...values.propParts],
       entranceCue: values.entranceCue.trim(),
+      entranceCueId: null,
+      entrancePending: false,
       lineNote: values.lineNote.trim(),
       operatorId: null,
       createdAt: nowIso(),
@@ -235,17 +283,78 @@ export default function RoleAssign() {
       ),
     },
     {
-      title: '出场提示',
+      title: '出场挂钩（锣鼓点）',
+      dataIndex: 'entranceCueId',
+      width: 250,
+      render: (_value, record) => {
+        const state = entranceLinkState(record);
+        const pending = isEntrancePending(record);
+        const linkedCue = pending ? null : record.entranceCueId ? cueById.get(record.entranceCueId) ?? null : null;
+        return (
+          <Space direction="vertical" size={4} style={{ width: '100%' }}>
+            <Select<string | null>
+              size="small"
+              style={{ width: '100%' }}
+              // 待重排时旧鼓点已不在候选里，按空值显示，逼出占位提示与红框
+              value={pending ? null : record.entranceCueId}
+              allowClear
+              placeholder={cues.length > 0 ? '从本场鼓点里挑一处挂上' : '本场还没有锣鼓点'}
+              status={pending ? 'error' : ''}
+              notFoundContent={
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<SoundOutlined />}
+                  onClick={() => scene && navigate(ROUTES.cues(scene.id))}
+                >
+                  先去排锣鼓点
+                </Button>
+              }
+              options={cues.map((cue) => {
+                const mates = (roleNamesByCue.get(cue.id) ?? []).filter((name) => name !== record.name);
+                return {
+                  value: cue.id,
+                  label: `${secondsToTimecode(cue.atSecond)} ${BEAT_NAME_LABEL[cue.beatName]}${
+                    mates.length > 0 ? `（同点亮相：${mates.join('、')}）` : ''
+                  }`,
+                };
+              })}
+              onChange={(value) => void handleLinkCue(record.id, value ?? null)}
+            />
+            {state === 'linked' && linkedCue ? (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                <LinkOutlined /> 已挂钩 · 出场 {secondsToTimecode(linkedCue.atSecond)} 随鼓点走
+              </Typography.Text>
+            ) : null}
+            {pending ? (
+              <Typography.Text type="danger" style={{ fontSize: 12 }}>
+                出场待重排：原鼓点已撤，重新挑一处挂上
+              </Typography.Text>
+            ) : null}
+            {state === 'unlinked' ? (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                未挂钩 · 只看手写提示
+              </Typography.Text>
+            ) : null}
+          </Space>
+        );
+      },
+    },
+    {
+      title: '出场提示（手写）',
       dataIndex: 'entranceCue',
       width: 210,
       render: (_value, record) => (
-        <Input.TextArea
-          value={record.entranceCue}
-          autoSize={{ minRows: 2, maxRows: 3 }}
-          maxLength={80}
-          placeholder="如：四击头落定后自影窗右侧起伞"
-          onChange={(event) => void patchRole(record.id, { entranceCue: event.target.value })}
-        />
+        <Space direction="vertical" size={2} style={{ width: '100%' }}>
+          {entranceLinkState(record) === 'unlinked' ? <Tag>未挂钩</Tag> : null}
+          <Input.TextArea
+            value={record.entranceCue}
+            autoSize={{ minRows: 2, maxRows: 3 }}
+            maxLength={80}
+            placeholder="如：四击头落定后自影窗右侧起伞"
+            onChange={(event) => void patchRole(record.id, { entranceCue: event.target.value })}
+          />
+        </Space>
       ),
     },
     {
@@ -371,7 +480,25 @@ export default function RoleAssign() {
           <Col xs={12} md={6}>
             <Statistic title="操耍人档" value={operators.length} suffix="人" />
           </Col>
+          <Col xs={12} md={6}>
+            <Statistic
+              title="出场待重排"
+              value={pendingEntranceCount}
+              suffix="个"
+              valueStyle={pendingEntranceCount > 0 ? { color: '#cf1322' } : undefined}
+            />
+          </Col>
         </Row>
+
+        {pendingEntranceCount > 0 ? (
+          <Alert
+            style={{ marginTop: 14 }}
+            type="warning"
+            showIcon
+            message={`${pendingEntranceCount} 个角色出场待重排`}
+            description="这些角色挂过的锣鼓点已撤，请在「出场挂钩」列重新挑一处本场鼓点挂上，出场时刻即随新鼓点走。"
+          />
+        ) : null}
 
         <Alert
           style={{ marginTop: 14 }}
@@ -410,7 +537,7 @@ export default function RoleAssign() {
             columns={columns}
             dataSource={roles}
             pagination={false}
-            scroll={{ x: 1200 }}
+            scroll={{ x: 1460 }}
             expandable={{
               expandedRowRender: (record) => {
                 const assessmentList = optionsFor(record.id);

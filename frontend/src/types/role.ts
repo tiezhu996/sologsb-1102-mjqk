@@ -20,8 +20,12 @@ export interface ShadowRole {
   roleType: RoleType;
   /** 需备影件：头茬 / 身段 / 兵器 */
   propParts: PropPart[];
-  /** 出场提示 */
+  /** 出场提示（手写）：仅作文字备注，不参与出场时刻计算 */
   entranceCue: string;
+  /** 出场挂钩的本场锣鼓点 id；挂到鼓点上后出场时刻随鼓点秒点走，未挂钩为 null */
+  entranceCueId: string | null;
+  /** 出场待重排：原挂钩鼓点已撤，需重新挑一处挂回 */
+  entrancePending: boolean;
   /** 唱白要点 */
   lineNote: string;
   /** 已指派的操耍人 id，未指派为 null */
@@ -83,3 +87,23 @@ export function createEmptyRoleDraft(): RoleDraft {
     lineNote: '',
   };
 }
+
+/** 出场挂钩状态：已挂钩锣鼓点 / 待重排（鼓点已撤） / 未挂钩（只留手写提示） */
+export type EntranceLinkState = 'linked' | 'pending' | 'unlinked';
+
+/**
+ * 计算角色的出场挂钩状态。
+ * - linked：挂着仍存在的本场鼓点，出场时刻随鼓点秒点走
+ * - pending：挂过的鼓点已撤，需重新挑一处补齐
+ * - unlinked：没有挂钩，只看手写提示
+ */
+export function entranceLinkState(role: Pick<ShadowRole, 'entranceCueId' | 'entrancePending'>): EntranceLinkState {
+  if (role.entrancePending) return 'pending';
+  return role.entranceCueId ? 'linked' : 'unlinked';
+}
+
+export const ENTRANCE_LINK_LABEL: Record<EntranceLinkState, string> = {
+  linked: '已挂钩',
+  pending: '出场待重排',
+  unlinked: '未挂钩',
+};

@@ -5,6 +5,7 @@
 import type { Play } from '../types/play';
 import type { Scene } from '../types/scene';
 import type { ShadowRole } from '../types/role';
+import { entranceLinkState, ENTRANCE_LINK_LABEL } from '../types/role';
 import type { Operator } from '../types/operator';
 import type { PercussionCue } from '../types/cue';
 import { secondsToTimecode } from './timecode';
@@ -81,6 +82,9 @@ export function exportPlayCsv(
     '行当',
     '影件',
     '操耍人',
+    '出场状态',
+    '出场挂钩鼓点',
+    '出场秒点',
     '锣鼓点',
     '乐器',
     '秒点',
@@ -99,10 +103,13 @@ export function exportPlayCsv(
     .forEach((scene) => {
       const sceneRoles = roles.filter((role) => role.sceneId === scene.id);
       const sceneCues = cues.filter((cue) => cue.sceneId === scene.id).sort((a, b) => a.atSecond - b.atSecond);
+      const cueMap = new Map(sceneCues.map((cue) => [cue.id, cue]));
       const rowCount = Math.max(sceneRoles.length, sceneCues.length, 1);
       for (let index = 0; index < rowCount; index += 1) {
         const role = sceneRoles[index];
         const cue = sceneCues[index];
+        const linkState = role ? entranceLinkState(role) : 'unlinked';
+        const linkedCue = role && role.entranceCueId ? cueMap.get(role.entranceCueId) : undefined;
         lines.push(
           [
             index === 0 ? scene.seq : '',
@@ -114,6 +121,9 @@ export function exportPlayCsv(
             role ? ROLE_TYPE_LABEL[role.roleType] : '',
             role ? role.propParts.map((part) => PROP_PART_LABEL[part]).join('／') || '无需拆件' : '',
             role ? operatorName(role.operatorId) : '',
+            role ? ENTRANCE_LINK_LABEL[linkState] : '',
+            linkedCue ? BEAT_NAME_LABEL[linkedCue.beatName] : '',
+            linkedCue ? secondsToTimecode(linkedCue.atSecond) : '',
             cue ? BEAT_NAME_LABEL[cue.beatName] : '',
             cue ? INSTRUMENT_LABEL[cue.instrument] : '',
             cue ? secondsToTimecode(cue.atSecond) : '',
@@ -192,9 +202,11 @@ export function buildCallSheetText(
   scenes: Scene[],
   roles: ShadowRole[],
   operators: Operator[],
+  cues: PercussionCue[] = [],
 ): string {
   const operatorName = (id: string | null): string =>
     id === null ? '待指派' : operators.find((item) => item.id === id)?.name ?? '（已解绑）';
+  const cueById = new Map(cues.map((cue) => [cue.id, cue]));
   const lines: string[] = [];
   lines.push(`【${play.title}】排练通告（${PLAY_GENRE_LABEL[play.genre]} · ${PLAY_STATUS_LABEL[play.status]}）`);
   lines.push(`首演戏台：${play.premiereVenue || '未定'}`);
@@ -206,10 +218,18 @@ export function buildCallSheetText(
         `第${scene.seq}场 ${scene.title}｜${scene.durationMin}分钟｜${SHADOW_SCREEN_LABEL[scene.needsShadowScreen]}｜进度 ${scene.progress}%`,
       );
       sceneRoles.forEach((role) => {
+        const state = entranceLinkState(role);
+        const linkedCue = role.entranceCueId ? cueById.get(role.entranceCueId) : undefined;
+        const entrance =
+          state === 'linked' && linkedCue
+            ? `出场 ${secondsToTimecode(linkedCue.atSecond)} ${BEAT_NAME_LABEL[linkedCue.beatName]}`
+            : state === 'pending'
+              ? '出场待重排（原鼓点已撤）'
+              : '未挂钩（仅手写提示）';
         lines.push(
           `  · ${role.name}（${ROLE_TYPE_LABEL[role.roleType]}）操耍：${operatorName(role.operatorId)}｜影件：${
             role.propParts.map((part) => PROP_PART_LABEL[part]).join('／') || '无需拆件'
-          }`,
+          }｜${entrance}`,
         );
       });
     });

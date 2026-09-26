@@ -94,7 +94,7 @@ body::before {
 /* 时间轴 */
 .gb-ruler {
   position: relative;
-  height: 74px;
+  height: 92px;
   background: linear-gradient(180deg, #fffdf8, #f5ebd8);
   border: 1px solid var(--gb-line);
   border-radius: 10px;
@@ -148,6 +148,17 @@ body::before {
   background: rgba(255, 253, 248, 0.86);
   padding: 0 3px;
   border-radius: 4px;
+}
+
+.gb-cue-dot .gb-cue-roles {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #fffdf8;
+  background: var(--gb-red);
+  border-radius: 6px;
+  padding: 1px 5px;
 }
 
 .gb-playhead {
