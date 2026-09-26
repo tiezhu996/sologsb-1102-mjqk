@@ -14,7 +14,7 @@ import { nowIso } from './uuid';
 import { seedDatabase } from './seed';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** 数据库名 */
 export const DB_NAME = 'gbshadowplay';
@@ -31,7 +31,7 @@ export type RoleRow = ShadowRole & Revisioned;
 export type OperatorRow = Operator & Revisioned;
 export type CueRow = PercussionCue & Revisioned;
 
-export const ROW_REVISION = 2;
+export const ROW_REVISION = 3;
 
 class ShadowPlayDatabase extends Dexie {
   plays!: Table<PlayRow, string>;
@@ -53,7 +53,7 @@ class ShadowPlayDatabase extends Dexie {
     });
 
     // v2：新增 revision 行修订号；场次补充索引，锣鼓点补充 playId 冗余便于按剧目统计
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         plays: 'id, title, genre, status, createdAt, updatedAt',
         scenes: 'id, playId, seq, progress, needsShadowScreen',
@@ -72,9 +72,40 @@ class ShadowPlayDatabase extends Dexie {
         ];
         for (const table of tables) {
           await table.toCollection().modify((row: Record<string, unknown>) => {
-            row.revision = ROW_REVISION;
+            row.revision = 2;
             if (typeof row.updatedAt !== 'string') row.updatedAt = nowIso();
             if (typeof row.createdAt !== 'string') row.createdAt = row.updatedAt;
+          });
+        }
+      });
+
+    // v3：角色出场挂钩本场锣鼓点——roles 新增 entranceCueId / entrancePending
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        roles: 'id, sceneId, operatorId, roleType, name, entranceCueId, entrancePending',
+      })
+      .upgrade(async (tx) => {
+        const stamp = nowIso();
+        // 迁移：历史角色一律未挂钩；行结构修订号统一升到 v3
+        await tx
+          .table('roles')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.entranceCueId !== 'string') row.entranceCueId = null;
+            if (typeof row.entrancePending !== 'boolean') row.entrancePending = false;
+            row.revision = ROW_REVISION;
+            if (typeof row.updatedAt !== 'string') row.updatedAt = stamp;
+          });
+        // 其余表只随行结构修订号升级
+        const otherTables: Array<Table<Record<string, unknown>, string>> = [
+          tx.table('plays'),
+          tx.table('scenes'),
+          tx.table('operators'),
+          tx.table('cues'),
+        ];
+        for (const table of otherTables) {
+          await table.toCollection().modify((row: Record<string, unknown>) => {
+            row.revision = ROW_REVISION;
           });
         }
       });
@@ -210,8 +241,28 @@ export async function putCue(row: CueRow): Promise<void> {
   await db.cues.put(row);
 }
 
-export async function removeCue(id: string): Promise<void> {
-  await db.cues.delete(id);
+/**
+ * 撤销一处鼓点：鼓点照常删除；挂过它的角色解下挂钩并标为「出场待重排」，
+ * 重新挑一处鼓点后补齐（手写提示始终保留）。返回被波及、需重排的角色数。
+ */
+export async function removeCue(id: string): Promise<number> {
+  return db.transaction('rw', db.cues, db.roles, async () => {
+    const linked = await db.roles.where('entranceCueId').equals(id).toArray();
+    if (linked.length > 0) {
+      const stamp = nowIso();
+      await db.roles.bulkPut(
+        linked.map((role) => ({
+          ...role,
+          entranceCueId: null,
+          entrancePending: true,
+          updatedAt: stamp,
+          revision: ROW_REVISION,
+        })),
+      );
+    }
+    await db.cues.delete(id);
+    return linked.length;
+  });
 }
 
 /* --------------------------- 整库导入导出 --------------------------- */
@@ -255,6 +306,22 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
 
 /** 用快照覆盖整库（导入存档） */
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
+  // 兜底旧存档：补齐 v3 的角色挂钩字段；挂到的鼓点若不在存档内则视为待重排
+  const cueIds = new Set(snapshot.cues.map((cue) => cue.id));
+  const normalizeRole = (role: ShadowRole): ShadowRole => {
+    const entranceCueId =
+      typeof role.entranceCueId === 'string' && cueIds.has(role.entranceCueId) ? role.entranceCueId : null;
+    return {
+      ...role,
+      entranceCueId,
+      entrancePending:
+        typeof role.entranceCueId === 'string'
+          ? role.entrancePending || !cueIds.has(role.entranceCueId)
+          : typeof role.entrancePending === 'boolean'
+            ? role.entrancePending
+            : false,
+    };
+  };
   await db.transaction('rw', db.plays, db.scenes, db.roles, db.operators, db.cues, async () => {
     await Promise.all([
       db.plays.clear(),
@@ -266,7 +333,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION });
     await db.plays.bulkPut(snapshot.plays.map(rev));
     await db.scenes.bulkPut(snapshot.scenes.map(rev));
-    await db.roles.bulkPut(snapshot.roles.map(rev));
+    await db.roles.bulkPut(snapshot.roles.map(normalizeRole).map(rev));
     await db.operators.bulkPut(snapshot.operators.map(rev));
     await db.cues.bulkPut(snapshot.cues.map(rev));
   });

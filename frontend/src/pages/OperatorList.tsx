@@ -279,7 +279,27 @@ export default function OperatorList() {
       render: (value: RoleRow['propParts']) =>
         value.length > 0 ? value.map((part) => PROP_PART_LABEL[part]).join('／') : '无需拆件',
     },
-    { title: '出场提示', dataIndex: 'entranceCue', ellipsis: true },
+    {
+      title: '出场提示',
+      dataIndex: 'entranceCue',
+      ellipsis: true,
+      render: (value: string, record) => (
+        <Space size={4}>
+          <span>{value || '—'}</span>
+          {record.entrancePending ? (
+            <Tag color="error" style={{ marginInlineStart: 4 }}>
+              出场待重排
+            </Tag>
+          ) : record.entranceCueId ? (
+            <Tag color="gold" style={{ marginInlineStart: 4 }}>
+              已挂鼓点
+            </Tag>
+          ) : (
+            <Tag style={{ marginInlineStart: 4 }}>未挂钩</Tag>
+          )}
+        </Space>
+      ),
+    },
     {
       title: '操作',
       key: 'action',

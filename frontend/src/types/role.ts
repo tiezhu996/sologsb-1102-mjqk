@@ -20,8 +20,12 @@ export interface ShadowRole {
   roleType: RoleType;
   /** 需备影件：头茬 / 身段 / 兵器 */
   propParts: PropPart[];
-  /** 出场提示 */
+  /** 出场提示（手写，挂钩鼓点后仍原样保留，标为「未挂钩」） */
   entranceCue: string;
+  /** 已挂钩的本场锣鼓点 id；未挂钩为 null */
+  entranceCueId: string | null;
+  /** 出场待重排：挂钩的鼓点被撤销后置 true，重新挑一处鼓点后清除 */
+  entrancePending: boolean;
   /** 唱白要点 */
   lineNote: string;
   /** 已指派的操耍人 id，未指派为 null */
@@ -32,7 +36,7 @@ export interface ShadowRole {
   updatedAt: string;
 }
 
-/** 新建角色表单草稿 */
+/** 新建角色表单草稿（新角色默认未挂钩鼓点） */
 export type RoleDraft = Pick<
   ShadowRole,
   'name' | 'roleType' | 'propParts' | 'entranceCue' | 'lineNote'

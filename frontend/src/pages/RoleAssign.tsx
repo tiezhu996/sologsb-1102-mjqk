@@ -29,6 +29,7 @@ import {
   ArrowLeftOutlined,
   ArrowRightOutlined,
   DeleteOutlined,
+  DisconnectOutlined,
   PlusOutlined,
   ReloadOutlined,
   SaveOutlined,
@@ -53,16 +54,20 @@ import {
   type RoleDraft,
   type RoleType,
 } from '../types/role';
+import { BEAT_NAME_LABEL, INSTRUMENT_LABEL } from '../types/cue';
 import { SHADOW_SCREEN_LABEL } from '../types/scene';
 import {
   ROW_REVISION,
   getScene,
+  listCuesByScene,
   listRolesByScene,
   putRole,
   removeRole,
+  type CueRow,
   type RoleRow,
   type SceneRow,
 } from '../utils/db';
+import { secondsToTimecode } from '../utils/timecode';
 import { nowIso, uuid } from '../utils/uuid';
 
 export default function RoleAssign() {
@@ -73,6 +78,7 @@ export default function RoleAssign() {
 
   const [scene, setScene] = useState<SceneRow | null>(null);
   const [roles, setRoles] = useState<RoleRow[]>([]);
+  const [cues, setCues] = useState<CueRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [modalOpen, setModalOpen] = useState(false);
 
@@ -87,12 +93,14 @@ export default function RoleAssign() {
 
   const reload = useCallback(async () => {
     setLoading(true);
-    const [sceneRow, roleRows] = await Promise.all([
+    const [sceneRow, roleRows, cueRows] = await Promise.all([
       getScene(sceneId),
       listRolesByScene(sceneId),
+      listCuesByScene(sceneId),
     ]);
     setScene(sceneRow ?? null);
     setRoles(roleRows);
+    setCues(cueRows);
     setLoading(false);
     if (sceneRow) {
       await Promise.all([loadScenes(sceneRow.playId), loadOperators()]);
@@ -109,8 +117,36 @@ export default function RoleAssign() {
   const prevScene = currentIndex > 0 ? siblingScenes[currentIndex - 1] : null;
   const nextScene = currentIndex >= 0 && currentIndex < siblingScenes.length - 1 ? siblingScenes[currentIndex + 1] : null;
 
-  const assignedCount = roles.filter((role) => role.operatorId !== null).length;
-  const propPartTotal = roles.reduce((acc, role) => acc + role.propParts.length, 0);
+  const pendingEntranceCount = roles.filter((role) => role.entrancePending).length;
+
+  /** 本场鼓点按 id 索引，角色挂钩信息随鼓点秒点实时取，不抄秒数 */
+  const cueMap = useMemo(() => {
+    const map = new Map<string, CueRow>();
+    cues.forEach((cue) => map.set(cue.id, cue));
+    return map;
+  }, [cues]);
+
+  /** 每处鼓点上同时亮相的角色（用于提示「与谁一起出场」） */
+  const coEntrants = useMemo(() => {
+    const map = new Map<string, RoleRow[]>();
+    roles.forEach((role) => {
+      if (role.entranceCueId && !role.entrancePending) {
+        const list = map.get(role.entranceCueId) ?? [];
+        list.push(role);
+        map.set(role.entranceCueId, list);
+      }
+    });
+    return map;
+  }, [roles]);
+
+  const cueOptions = useMemo(
+    () =>
+      cues.map((cue) => ({
+        value: cue.id,
+        label: `${secondsToTimecode(cue.atSecond)} ${BEAT_NAME_LABEL[cue.beatName]}·${INSTRUMENT_LABEL[cue.instrument]}`,
+      })),
+    [cues],
+  );
 
   /** 每个角色的候选操耍人（含冲突评估），供 <AssigneePicker> 使用 */
   const optionsFor = useCallback(
@@ -140,6 +176,8 @@ export default function RoleAssign() {
       roleType: values.roleType,
       propParts: [...values.propParts],
       entranceCue: values.entranceCue.trim(),
+      entranceCueId: null,
+      entrancePending: false,
       lineNote: values.lineNote.trim(),
       operatorId: null,
       createdAt: nowIso(),
@@ -191,6 +229,22 @@ export default function RoleAssign() {
     message.success('已解绑操耍人');
   };
 
+  /** 把角色出场挂到本场某一处鼓点；待重排角色重新挑一处即补齐 */
+  const handleHookCue = async (roleId: string, cueId: string | null) => {
+    if (cueId === null) {
+      await patchRole(roleId, { entranceCueId: null, entrancePending: false });
+      message.success('已取下挂钩，出场改看手写提示（未挂钩）');
+      return;
+    }
+    const cue = cueMap.get(cueId);
+    if (!cue) {
+      message.warning('该鼓点不在本场，请重新挑选');
+      return;
+    }
+    await patchRole(roleId, { entranceCueId: cueId, entrancePending: false });
+    message.success(`已挂到 ${secondsToTimecode(cue.atSecond)}「${BEAT_NAME_LABEL[cue.beatName]}」`);
+  };
+
   const columns: ColumnsType<RoleRow> = [
     {
       title: '影人角色',
@@ -235,17 +289,116 @@ export default function RoleAssign() {
       ),
     },
     {
-      title: '出场提示',
+      title: '出场鼓点（挂钩）',
+      dataIndex: 'entranceCueId',
+      width: 240,
+      render: (_value, record) => {
+        const linkedCue = record.entranceCueId ? cueMap.get(record.entranceCueId) : undefined;
+        const together =
+          linkedCue && record.entranceCueId
+            ? (coEntrants.get(record.entranceCueId) ?? []).filter((item) => item.id !== record.id)
+            : [];
+        if (record.entrancePending) {
+          return (
+            <Space direction="vertical" size={4} style={{ width: '100%' }}>
+              <Tag color="error" icon={<DisconnectOutlined />}>
+                出场待重排
+              </Tag>
+              <Select<string | null>
+                size="small"
+                style={{ width: '100%' }}
+                placeholder="重新挑一处本场鼓点"
+                options={cueOptions}
+                value={null}
+                onChange={(cueId) => void handleHookCue(record.id, cueId)}
+              />
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                原鼓点已撤销，挂钩补齐前出场以手写提示为准。
+              </Typography.Text>
+            </Space>
+          );
+        }
+        if (linkedCue) {
+          return (
+            <Space direction="vertical" size={4} style={{ width: '100%' }}>
+              <Select<string | null>
+                size="small"
+                style={{ width: '100%' }}
+                value={linkedCue.id}
+                options={cueOptions}
+                onChange={(cueId) => void handleHookCue(record.id, cueId)}
+              />
+              <Space size={4} wrap>
+                <Tag color="#7a1f1f" className="gb-mono">
+                  {secondsToTimecode(linkedCue.atSecond)}
+                </Tag>
+                <Tag color="volcano">{BEAT_NAME_LABEL[linkedCue.beatName]}</Tag>
+                {together.length > 0 ? (
+                  <Tooltip title={together.map((item) => item.name).join('、')}>
+                    <Tag color="gold">与 {together.length} 个角色同点亮相</Tag>
+                  </Tooltip>
+                ) : null}
+              </Space>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                秒点随鼓点走，鼓点改秒不用重抄；
+                <Button
+                  type="link"
+                  size="small"
+                  style={{ padding: '0 0 0 2px', height: 'auto', fontSize: 12 }}
+                  onClick={() => void handleHookCue(record.id, null)}
+                >
+                  取下挂钩
+                </Button>
+              </Typography.Text>
+            </Space>
+          );
+        }
+        return (
+          <Space direction="vertical" size={4} style={{ width: '100%' }}>
+            <Select<string | null>
+              size="small"
+              style={{ width: '100%' }}
+              allowClear
+              placeholder={cues.length > 0 ? '从本场鼓点挑一处挂上' : '本场还没有鼓点'}
+              disabled={cues.length === 0}
+              options={cueOptions}
+              value={null}
+              onChange={(cueId) => void handleHookCue(record.id, cueId ?? null)}
+            />
+            <Button
+              type="link"
+              size="small"
+              style={{ padding: 0, height: 'auto', fontSize: 12 }}
+              disabled={!scene}
+              onClick={() => scene && navigate(ROUTES.cues(scene.id))}
+            >
+              去本场锣鼓点插一处
+            </Button>
+          </Space>
+        );
+      },
+    },
+    {
+      title: '出场提示（手写）',
       dataIndex: 'entranceCue',
-      width: 210,
+      width: 220,
       render: (_value, record) => (
-        <Input.TextArea
-          value={record.entranceCue}
-          autoSize={{ minRows: 2, maxRows: 3 }}
-          maxLength={80}
-          placeholder="如：四击头落定后自影窗右侧起伞"
-          onChange={(event) => void patchRole(record.id, { entranceCue: event.target.value })}
-        />
+        <Space direction="vertical" size={4} style={{ width: '100%' }}>
+          <Input.TextArea
+            value={record.entranceCue}
+            autoSize={{ minRows: 2, maxRows: 3 }}
+            maxLength={80}
+            placeholder="如：四击头落定后自影窗右侧起伞"
+            onChange={(event) => void patchRole(record.id, { entranceCue: event.target.value })}
+          />
+          {record.entrancePending ? (
+            <Tag color="error">未挂钩·鼓点已撤</Tag>
+          ) : record.entranceCueId && cueMap.has(record.entranceCueId) ? (
+            <Tag color="default">已挂钩上方鼓点</Tag>
+          ) : (
+            <Tag>未挂钩</Tag>
+          )}
+        </Space>
       ),
     },
     {
@@ -363,15 +516,30 @@ export default function RoleAssign() {
             <Statistic title="影人角色" value={roles.length} />
           </Col>
           <Col xs={12} md={6}>
-            <Statistic title="已指派操耍人" value={assignedCount} suffix={`/ ${roles.length}`} />
+            <Statistic title="已挂钩出场鼓点" value={roles.filter((role) => role.entranceCueId && !role.entrancePending).length} suffix={`/ ${roles.length}`} />
           </Col>
           <Col xs={12} md={6}>
-            <Statistic title="需备影件" value={propPartTotal} suffix="件" />
+            <Statistic
+              title="出场待重排"
+              value={pendingEntranceCount}
+              suffix="个"
+              valueStyle={pendingEntranceCount > 0 ? { color: '#cf1322' } : undefined}
+            />
           </Col>
           <Col xs={12} md={6}>
-            <Statistic title="操耍人档" value={operators.length} suffix="人" />
+            <Statistic title="本场鼓点" value={cues.length} suffix="处" />
           </Col>
         </Row>
+
+        {pendingEntranceCount > 0 ? (
+          <Alert
+            style={{ marginTop: 14 }}
+            type="warning"
+            showIcon
+            message={`有 ${pendingEntranceCount} 个角色的出场鼓点已被撤销，标为「出场待重排」`}
+            description="鼓点撤销后不影响删除，只需在对应行的「出场鼓点」里重新挑一处本场鼓点即可补齐；补齐前以手写出场提示为准。"
+          />
+        ) : null}
 
         <Alert
           style={{ marginTop: 14 }}
@@ -410,7 +578,7 @@ export default function RoleAssign() {
             columns={columns}
             dataSource={roles}
             pagination={false}
-            scroll={{ x: 1200 }}
+            scroll={{ x: 1480 }}
             expandable={{
               expandedRowRender: (record) => {
                 const assessmentList = optionsFor(record.id);
@@ -512,15 +680,18 @@ export default function RoleAssign() {
           >
             <Checkbox.Group options={[...PROP_PART_OPTIONS]} />
           </Form.Item>
-          <Form.Item name="entranceCue" label="出场提示" rules={[{ max: 80, message: '不超过 80 个字' }]}>
+          <Form.Item
+            name="entranceCue"
+            label="出场提示（手写，暂未挂钩）"
+            rules={[{ max: 80, message: '不超过 80 个字' }]}
+          >
             <Input placeholder="如：小锣三击后自左侧上场" />
           </Form.Item>
           <Form.Item name="lineNote" label="唱白要点" rules={[{ max: 140, message: '不超过 140 个字' }]}>
             <Input.TextArea rows={3} placeholder="拖腔、咬字、换气等要点" />
           </Form.Item>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            新增后可在表格中直接指派操耍人，行当标签会以{' '}
-            {ROLE_TYPE_OPTIONS.map((option) => `${option.label}(${ROLE_TYPE_COLOR[option.value]})`).join('、')} 展示。
+            新增后可在表格「出场鼓点」列把出场挂到本场某一处锣鼓点；一处鼓点可挂多个角色一起亮相，鼓点改秒后出场时刻自动跟随。手写提示始终保留，未挂钩时照常参考。
           </Typography.Text>
         </Form>
       </Modal>

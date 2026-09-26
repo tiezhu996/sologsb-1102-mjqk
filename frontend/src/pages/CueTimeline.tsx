@@ -63,9 +63,11 @@ import {
   ROW_REVISION,
   getScene,
   listCuesByScene,
+  listRolesByScene,
   putCue,
   removeCue,
   type CueRow,
+  type RoleRow,
   type SceneRow,
 } from '../utils/db';
 import { buildRulerTicks, secondsToPercent, secondsToTimecode, timecodeToSeconds } from '../utils/timecode';
@@ -79,6 +81,7 @@ export default function CueTimeline() {
 
   const [scene, setScene] = useState<SceneRow | null>(null);
   const [cues, setCues] = useState<CueRow[]>([]);
+  const [roles, setRoles] = useState<RoleRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [cursorSecond, setCursorSecond] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -94,9 +97,14 @@ export default function CueTimeline() {
 
   const reload = useCallback(async () => {
     setLoading(true);
-    const [sceneRow, cueRows] = await Promise.all([getScene(sceneId), listCuesByScene(sceneId)]);
+    const [sceneRow, cueRows, roleRows] = await Promise.all([
+      getScene(sceneId),
+      listCuesByScene(sceneId),
+      listRolesByScene(sceneId),
+    ]);
     setScene(sceneRow ?? null);
     setCues(cueRows);
+    setRoles(roleRows);
     setLoading(false);
     if (sceneRow) {
       await Promise.all([loadScenes(sceneRow.playId), loadOperators()]);
@@ -118,6 +126,21 @@ export default function CueTimeline() {
   const durationSecond = scene ? Math.max(1, scene.durationMin) * 60 : 60;
   const ticks = useMemo(() => buildRulerTicks(durationSecond), [durationSecond]);
   const sortedCues = useMemo(() => [...cues].sort((a, b) => a.atSecond - b.atSecond), [cues]);
+
+  /** 挂在各鼓点上一起亮相的角色；角色不存秒数，时刻随 cue.atSecond 取 */
+  const rolesByCue = useMemo(() => {
+    const map = new Map<string, RoleRow[]>();
+    roles.forEach((role) => {
+      if (role.entranceCueId && !role.entrancePending) {
+        const list = map.get(role.entranceCueId) ?? [];
+        list.push(role);
+        map.set(role.entranceCueId, list);
+      }
+    });
+    return map;
+  }, [roles]);
+
+  const pendingRoleCount = useMemo(() => roles.filter((role) => role.entrancePending).length, [roles]);
 
   /** 试排播放：按秒推进游标，到时辰停止 */
   const lastFrameRef = useRef<number>(0);
@@ -240,15 +263,29 @@ export default function CueTimeline() {
   };
 
   const handleDelete = (cue: CueRow) => {
+    const linkedRoles = rolesByCue.get(cue.id) ?? [];
     modal.confirm({
       title: `删除 ${secondsToTimecode(cue.atSecond)} 的「${BEAT_NAME_LABEL[cue.beatName]}」？`,
+      content:
+        linkedRoles.length > 0
+          ? `该鼓点上挂着 ${linkedRoles.map((role) => role.name).join('、')} 的出场。鼓点照常删除，这 ${
+              linkedRoles.length
+            } 个角色会标为「出场待重排」，需重新挑一处鼓点。`
+          : '删除后不影响其他鼓点。',
       okText: '删除',
       okButtonProps: { danger: true },
       cancelText: '取消',
       onOk: async () => {
-        await removeCue(cue.id);
+        const affected = await removeCue(cue.id);
         setCues((prev) => prev.filter((item) => item.id !== cue.id));
-        message.success('鼓点已删除');
+        setRoles((prev) =>
+          prev.map((role) =>
+            role.entranceCueId === cue.id
+              ? { ...role, entranceCueId: null, entrancePending: true }
+              : role,
+          ),
+        );
+        message.success(affected > 0 ? `鼓点已删除，${affected} 个角色标记为出场待重排` : '鼓点已删除');
       },
     });
   };
@@ -298,6 +335,30 @@ export default function CueTimeline() {
           {INSTRUMENT_LABEL[value]}
         </Tag>
       ),
+    },
+    {
+      title: '出场影人',
+      key: 'entranceRoles',
+      width: 200,
+      render: (_value, record) => {
+        const linkedRoles = rolesByCue.get(record.id) ?? [];
+        if (linkedRoles.length === 0) {
+          return (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              未挂角色
+            </Typography.Text>
+          );
+        }
+        return (
+          <Space size={4} wrap>
+            {linkedRoles.map((role) => (
+              <Tooltip key={role.id} title={`出场时刻随本鼓点：${secondsToTimecode(record.atSecond)}`}>
+                <Tag color="gold">{role.name}</Tag>
+              </Tooltip>
+            ))}
+          </Space>
+        );
+      },
     },
     {
       title: '领奏操耍人',
@@ -419,6 +480,25 @@ export default function CueTimeline() {
             <Statistic title="已过鼓点" value={passedCount} suffix={`/ ${cues.length}`} />
           </Col>
         </Row>
+
+        {pendingRoleCount > 0 ? (
+          <Alert
+            style={{ marginTop: 14 }}
+            type="warning"
+            showIcon
+            message={`本场有 ${pendingRoleCount} 个角色「出场待重排」`}
+            description={
+              <Space direction="vertical" size={2}>
+                <Typography.Text style={{ fontSize: 12 }}>
+                  它们原挂的鼓点已被撤销。到「角色指派」页重新挑一处本场鼓点即可补齐；补齐前出场以手写提示为准。
+                </Typography.Text>
+                <Button size="small" icon={<TeamOutlined />} onClick={() => scene && navigate(ROUTES.roles(scene.id))}>
+                  去角色指派补齐
+                </Button>
+              </Space>
+            }
+          />
+        ) : null}
       </div>
 
       <Row gutter={16}>
@@ -445,7 +525,7 @@ export default function CueTimeline() {
                     startTimecode={item.startTimecode}
                     endTimecode={item.endTimecode}
                     cueCount={item.scene.id === sceneId ? cues.length : 0}
-                    roleCount={0}
+                    roleCount={item.scene.id === sceneId ? roles.length : 0}
                     selected={selectedSceneIds.includes(item.scene.id)}
                     selectable
                     compact
@@ -513,32 +593,38 @@ export default function CueTimeline() {
                     <span className="gb-mono">{secondsToTimecode(tick)}</span>
                   </div>
                 ))}
-                {sortedCues.map((cue) => (
-                  <div
-                    key={cue.id}
-                    className="gb-cue-dot"
-                    style={{ left: `${secondsToPercent(cue.atSecond, durationSecond)}%` }}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      openEdit(cue);
-                    }}
-                    title={`${secondsToTimecode(cue.atSecond)} ${BEAT_NAME_LABEL[cue.beatName]}（${
-                      INSTRUMENT_LABEL[cue.instrument]
-                    }）点击编辑`}
-                  >
-                    <b className="gb-mono">{secondsToTimecode(cue.atSecond)}</b>
-                    <i
-                      style={{
-                        background: INSTRUMENT_COLOR[cue.instrument],
-                        transform: activeCueId === cue.id ? 'scale(1.6)' : 'scale(1)',
-                        transition: 'transform 0.18s ease',
+                {sortedCues.map((cue) => {
+                  const linkedRoles = rolesByCue.get(cue.id) ?? [];
+                  return (
+                    <div
+                      key={cue.id}
+                      className="gb-cue-dot"
+                      style={{ left: `${secondsToPercent(cue.atSecond, durationSecond)}%` }}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        openEdit(cue);
                       }}
-                    />
-                    <span style={{ color: 'rgba(43,26,18,0.7)' }}>
-                      {BEAT_NAME_LABEL[cue.beatName]}·{INSTRUMENT_LABEL[cue.instrument]}
-                    </span>
-                  </div>
-                ))}
+                      title={`${secondsToTimecode(cue.atSecond)} ${BEAT_NAME_LABEL[cue.beatName]}（${
+                        INSTRUMENT_LABEL[cue.instrument]
+                      }）${
+                        linkedRoles.length > 0 ? `｜出场：${linkedRoles.map((role) => role.name).join('、')}` : ''
+                      }｜点击编辑`}
+                    >
+                      <b className="gb-mono">{secondsToTimecode(cue.atSecond)}</b>
+                      <i
+                        style={{
+                          background: INSTRUMENT_COLOR[cue.instrument],
+                          transform: activeCueId === cue.id ? 'scale(1.6)' : 'scale(1)',
+                          transition: 'transform 0.18s ease',
+                        }}
+                      />
+                      <span style={{ color: 'rgba(43,26,18,0.7)' }}>
+                        {BEAT_NAME_LABEL[cue.beatName]}·{INSTRUMENT_LABEL[cue.instrument]}
+                        {linkedRoles.length > 0 ? `｜${linkedRoles.map((role) => role.name).join('、')}` : ''}
+                      </span>
+                    </div>
+                  );
+                })}
                 <div className="gb-playhead" style={{ left: `${secondsToPercent(cursorSecond, durationSecond)}%` }} />
               </div>
             </div>
